@@ -1,4 +1,8 @@
+#ifdef GATES32_HEADLESS
+#include "headless_sdl.h"
+#else
 #include <SDL.h>
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -11,14 +15,30 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#ifdef GATES32_HEADLESS
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#endif
 
 namespace {
 
 constexpr int kWidth = 384;
 constexpr int kHeight = 400;
+// gates32.exe owns a 640x400 software framebuffer even though the playable
+// area remains 384x400. FUN_004061d0 uses that framebuffer width when its
+// bouncing anime callback reflects an x velocity; gates32dc.exe instead uses
+// its 384px framebuffer. This DirectX-only boundary is gameplay-significant.
+constexpr int kDirectXEffectBounceWidth = 640;
 constexpr int kTickMs = 25; // The original default is 40 fps.
 constexpr int32_t kOne = 1 << 16;
 
@@ -98,6 +118,10 @@ struct Voice {
   size_t position = 0;
 };
 
+// DAT_0041b8b8: number of DirectSound secondary buffers allocated per effect.
+// A zero entry means the wrapper suppresses that sound request entirely.
+constexpr std::array<size_t, 10> kSoundCopies = {3, 1, 1, 3, 3, 1, 2, 0, 3, 1};
+
 struct ReplayHeader {
   uint32_t seed = 1;
   uint32_t randomIndex = 0;
@@ -122,6 +146,11 @@ class Gates32 {
   bool initialize();
   void shutdown();
   void browserFrame();
+  bool loadReplayFile(const char* path);
+#ifdef GATES32_HEADLESS
+  bool initializeHeadless(const char* assetRoot);
+  int runHeadlessSolver(int argc, char** argv);
+#endif
 
  private:
   SDL_Window* window_ = nullptr;
@@ -136,7 +165,8 @@ class Gates32 {
   SDL_AudioDeviceID audioDevice_ = 0;
   SDL_AudioSpec audioSpec_{};
   std::array<AudioClip, 10> clips_{};
-  std::array<Voice, 32> voices_{};
+  std::array<std::vector<Voice>, 10> voices_{};
+  std::array<size_t, 10> currentVoice_{};
   std::array<SpriteInfo, 1536> sprites_{};
   std::array<int8_t, 256> atanLut_{};
   std::array<int16_t, 256> sin16_{};
@@ -145,6 +175,7 @@ class Gates32 {
   std::array<int32_t, 256> cos32_{};
   std::array<int16_t, 1024> randomTable_{};
   std::vector<uint8_t> runtimeCommon_;
+  std::string assetRoot_ = "/assets";
 
   std::vector<Entity> enemies_ = std::vector<Entity>(32);
   std::vector<Entity> enemyBullets_ = std::vector<Entity>(320);
@@ -211,12 +242,64 @@ class Gates32 {
   bool publishTraceAfterFrame_ = false;
   bool traceCompact_ = false;
   bool traceEndStates_ = false;
+  bool audioTraceEnabled_ = false;
+  int audioTraceSource_ = -1;
   uint64_t traceFrameStart_ = 1;
   uint64_t traceFrameLimit_ = 0;
   size_t replayPosition_ = 0;
   ReplayHeader replayHeader_{};
   std::vector<uint8_t> replayInput_;
   std::string stateTrace_;
+  std::string audioEventTrace_;
+
+#ifdef GATES32_HEADLESS
+  bool forcedInputActive_ = false;
+  uint8_t forcedInput_ = 0;
+  struct SimulationState {
+    std::vector<Entity> enemies;
+    std::vector<Entity> enemyBullets;
+    std::vector<Entity> playerShots;
+    std::vector<Entity> effects;
+    std::vector<Entity> bombEffects;
+    std::vector<Entity> particles;
+    std::vector<std::array<int, 2>> enemyCachedBottomRight;
+    size_t worldCapacity = 0;
+    size_t enemyManagerCount = 0;
+    size_t enemyBulletManagerCount = 0;
+    size_t effectManagerCount = 0;
+    size_t bombEffectManagerCount = 0;
+    size_t particleManagerCount = 0;
+    Entity effectOverflow{};
+    Screen screen = Screen::Title;
+    uint64_t frameNumber = 0;
+    int32_t playerX = 0;
+    int32_t playerY = 0;
+    int lives = 0;
+    int invulnerable = 0;
+    int shotCooldown = 0;
+    bool piercingShotsEnabled = false;
+    int score = 0;
+    int highScore = 0;
+    int nextOneUp = 0;
+    int deflation = 0;
+    int level = 0;
+    int endTimer = 0;
+    uint64_t endStartFrame = 0;
+    bool scoreSubmitted = false;
+    int stageState = 0;
+    int stageCounter = 0;
+    int stageCountdown = 0;
+    int stagePeriod = 0;
+    uint32_t randomSeed = 0;
+    int randomIndex = 0;
+    std::array<int16_t, 1024> randomTable{};
+  };
+
+  SimulationState captureSimulationState() const;
+  void restoreSimulationState(const SimulationState& state);
+  void updateForced(uint8_t input);
+  int64_t solverEvaluation() const;
+#endif
 
   static void audioCallback(void* userdata, Uint8* stream, int len);
   bool loadImages();
@@ -234,6 +317,7 @@ class Gates32 {
   void startBundledReplay();
   void startPreviousReplay();
   void startReplay(bool reloadBundled);
+  bool readReplayFile(const char* path);
   void finishReplayRecording();
   void configurePools();
   void resetObjects();
@@ -311,12 +395,20 @@ class Gates32 {
   uint64_t stateHash(uint8_t input) const;
   void appendStateTrace(uint8_t input);
   void publishStateTrace();
+  void publishAudioEventTrace();
   void saveStateTrace();
+  std::string assetPath(const char* relative) const;
 };
 
 uint32_t Gates32::currentSeed() {
   uint32_t value = static_cast<uint32_t>(SDL_GetTicks());
   return value == 0 ? 1 : value;
+}
+
+std::string Gates32::assetPath(const char* relative) const {
+  if (assetRoot_.empty()) return relative;
+  const char tail = assetRoot_.back();
+  return assetRoot_ + (tail == '/' || tail == '\\' ? "" : "/") + relative;
 }
 
 SDL_Texture* Gates32::loadTexture(const char* path, bool colorKey) {
@@ -339,14 +431,14 @@ SDL_Texture* Gates32::loadTexture(const char* path, bool colorKey) {
 
 bool Gates32::loadImages() {
   // The DirectDraw version uses the green first palette entry as a color key.
-  titleTexture_ = loadTexture("/assets/original/title.bmp", true);
-  spriteTexture_ = loadTexture("/assets/runtime/sprites.bmp", true);
+  titleTexture_ = loadTexture(assetPath("original/title.bmp").c_str(), true);
+  spriteTexture_ = loadTexture(assetPath("runtime/sprites.bmp").c_str(), true);
   // FUN_00408c90/FUN_00408d50 copy every byte in each 8-pixel glyph row.
   // Unlike sprites, palette index zero is therefore an opaque text backdrop.
-  font8Texture_ = loadTexture("/assets/original/string.bmp", false);
-  font16Texture_ = loadTexture("/assets/original/string16.bmp", false);
+  font8Texture_ = loadTexture(assetPath("original/string.bmp").c_str(), false);
+  font16Texture_ = loadTexture(assetPath("original/string16.bmp").c_str(), false);
 
-  SDL_Surface* back = SDL_LoadBMP("/assets/original/back.bmp");
+  SDL_Surface* back = SDL_LoadBMP(assetPath("original/back.bmp").c_str());
   if (back) {
     backTexture_ = SDL_CreateTextureFromSurface(renderer_, back);
     const Uint8* row = static_cast<const Uint8*>(back->pixels);
@@ -362,7 +454,7 @@ bool Gates32::loadImages() {
 }
 
 bool Gates32::loadSpriteInfo() {
-  std::ifstream input("/assets/runtime/sprites.dat", std::ios::binary);
+  std::ifstream input(assetPath("runtime/sprites.dat"), std::ios::binary);
   if (!input) return false;
   input.read(reinterpret_cast<char*>(sprites_.data()),
              static_cast<std::streamsize>(sprites_.size() * sizeof(SpriteInfo)));
@@ -372,7 +464,7 @@ bool Gates32::loadSpriteInfo() {
 bool Gates32::loadMathTables() {
   // These ranges were dumped from the initialized data section. Loading them
   // avoids differences between x87 rounding in the 1998 executable and wasm.
-  std::ifstream input("/assets/runtime/runtime-common.bin", std::ios::binary);
+  std::ifstream input(assetPath("runtime/runtime-common.bin"), std::ios::binary);
   if (!input) return false;
   runtimeCommon_.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
   if (runtimeCommon_.size() < 0x3ef0) return false;
@@ -389,13 +481,16 @@ void Gates32::audioCallback(void* userdata, Uint8* stream, int len) {
   auto* output = reinterpret_cast<float*>(stream);
   const size_t count = static_cast<size_t>(len) / sizeof(float);
   std::fill(output, output + count, 0.0f);
-  for (Voice& voice : game->voices_) {
-    if (!voice.clip) continue;
-    const size_t left = voice.clip->samples.size() - voice.position;
-    const size_t mixing = std::min(count, left);
-    for (size_t i = 0; i < mixing; ++i) output[i] += voice.clip->samples[voice.position + i] * 0.32f;
-    voice.position += mixing;
-    if (voice.position >= voice.clip->samples.size()) voice = {};
+  for (auto& pool : game->voices_) {
+    for (Voice& voice : pool) {
+      if (!voice.clip) continue;
+      const size_t left = voice.clip->samples.size() - voice.position;
+      const size_t mixing = std::min(count, left);
+      for (size_t i = 0; i < mixing; ++i)
+        output[i] += voice.clip->samples[voice.position + i];
+      voice.position += mixing;
+      if (voice.position >= voice.clip->samples.size()) voice = {};
+    }
   }
   for (size_t i = 0; i < count; ++i) output[i] = std::clamp(output[i], -1.0f, 1.0f);
 }
@@ -412,11 +507,16 @@ bool Gates32::loadAudio() {
                                      SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
   if (!audioDevice_) return false;
 
+  for (size_t id = 0; id < voices_.size(); ++id) {
+    voices_[id].assign(kSoundCopies[id], {});
+    currentVoice_[id] = 0;
+  }
+
   const std::array<const char*, 10> names = {
       "fmake14.wav", "dg06.wav", "rai03_.wav", "bom1.wav", "bom2.wav",
       "fmake04.wav", "fmake18_.wav", "accent1.wav", "fpcm14.wav", "bomber.wav"};
   for (size_t i = 0; i < names.size(); ++i) {
-    std::string path = std::string("/assets/original/") + names[i];
+    std::string path = assetPath((std::string("original/") + names[i]).c_str());
     SDL_AudioSpec source{};
     Uint8* bytes = nullptr;
     Uint32 length = 0;
@@ -444,13 +544,28 @@ bool Gates32::loadAudio() {
 }
 
 void Gates32::playSound(int id) {
-  if (!soundEnabled_ || id < 0 || id >= static_cast<int>(clips_.size()) || !audioDevice_) return;
-  SDL_LockAudioDevice(audioDevice_);
-  Voice* selected = nullptr;
-  for (Voice& voice : voices_) {
-    if (!voice.clip) { selected = &voice; break; }
+  if (audioTraceEnabled_) {
+    audioEventTrace_ += std::to_string(frameNumber_) + ',' + std::to_string(id) + ',' +
+                        std::to_string(audioTraceSource_) + '\n';
   }
-  if (!selected) selected = &voices_[0];
+  if (!soundEnabled_ || id < 0 || id >= static_cast<int>(clips_.size()) || !audioDevice_) return;
+  const size_t copies = kSoundCopies[static_cast<size_t>(id)];
+  if (copies == 0) return;
+  SDL_LockAudioDevice(audioDevice_);
+  auto& pool = voices_[static_cast<size_t>(id)];
+  size_t& current = currentVoice_[static_cast<size_t>(id)];
+  Voice* selected = &pool[current];
+  if (selected->clip) {
+    // FUN_004046f0 drops a retrigger when a sound owns only one secondary
+    // buffer. Multi-buffer sounds rotate, forcibly restarting the next copy
+    // if all copies are already playing.
+    if (copies == 1) {
+      SDL_UnlockAudioDevice(audioDevice_);
+      return;
+    }
+    current = (current + 1) % copies;
+    selected = &pool[current];
+  }
   selected->clip = &clips_[id];
   selected->position = 0;
   SDL_UnlockAudioDevice(audioDevice_);
@@ -513,7 +628,31 @@ bool Gates32::initialize() {
   loadRanking();
   loadBundledReplay();
 #ifdef __EMSCRIPTEN__
-  if (EM_ASM_INT({ return new URLSearchParams(location.search).get('trace') === '1' ? 1 : 0; })) {
+  const bool traceRequested = EM_ASM_INT({
+    return new URLSearchParams(location.search).get('trace') === '1' ? 1 : 0;
+  }) != 0;
+  const bool queryReplayReady = EM_ASM_INT({ return window.gates32QueryReplayReady ? 1 : 0; }) != 0;
+  auto publishQueryReplayStatus = [this]() {
+    EM_ASM({
+      var status = document.getElementById('status');
+      if (status) {
+        var name = window.gates32QueryReplayName || 'replay.rep';
+        var frames = Number(window.gates32QueryReplayFrames) || $0;
+        status.dataset.replayLoad = 'success';
+        status.dataset.replaySource = 'url';
+        status.dataset.replayName = name;
+        status.dataset.replayFrames = String(frames);
+        status.textContent = document.documentElement.lang === 'ja'
+          ? name + ' を再生中（' + frames + 'フレーム）'
+          : 'Playing ' + name + ' (' + frames + ' frames)';
+      }
+    }, static_cast<int>(replayInput_.size()));
+  };
+  if (traceRequested) {
+    audioTraceEnabled_ = EM_ASM_INT({
+      return new URLSearchParams(location.search).get('audioTrace') === '1' ? 1 : 0;
+    }) != 0;
+    if (audioTraceEnabled_) audioEventTrace_ = "frame,sound_id,source\n";
     traceCompact_ = EM_ASM_INT({
       return new URLSearchParams(location.search).get('traceCompact') === '1' ? 1 : 0;
     }) != 0;
@@ -541,9 +680,17 @@ bool Gates32::initialize() {
       // Trace mode therefore runs only the deterministic 40 Hz logic here.
       const bool restoreSound = soundEnabled_;
       soundEnabled_ = false;
-      for (size_t guard = 0; guard <= replayInput_.size() && traceActive_; ++guard) update();
+      const uint64_t updateLimit = traceFrameLimit_ != 0
+                                       ? traceFrameLimit_
+                                       : static_cast<uint64_t>(replayInput_.size()) + 1;
+      for (uint64_t guard = 0; guard < updateLimit && traceActive_; ++guard) update();
       soundEnabled_ = restoreSound;
+      publishAudioEventTrace();
+      if (queryReplayReady) publishQueryReplayStatus();
     }
+  } else if (queryReplayReady) {
+    startReplay(false);
+    publishQueryReplayStatus();
   }
 #endif
   lastBrowserTime_ = SDL_GetTicks();
@@ -576,6 +723,7 @@ Entity* Gates32::allocate(std::vector<Entity>& pool, EntityKind kind) {
       const int32_t staleVx = entity.vx;
       const int32_t staleVy = entity.vy;
       const int staleAngle = entity.angle;
+      const int staleSteerAngle = entity.steerAngle;
       const int32_t staleSlotData30 = entity.slotData30;
       const int staleAnimeDelay = entity.animeDelay;
       const int staleFrameFirst = entity.frameFirst;
@@ -593,7 +741,14 @@ Entity* Gates32::allocate(std::vector<Entity>& pool, EntityKind kind) {
       // The type-specific event-1 constructors do not clear the common
       // movement mode at +0x18. A slot once used by the hard Gates2 can thus
       // make a later ordinary enemy retain edge-bounce behaviour.
-      if (&pool == &enemies_) entity.bounce = staleBounce;
+      if (&pool == &enemies_) {
+        entity.bounce = staleBounce;
+        // Gates2's event-1 constructor leaves byte +0x3c untouched. A later
+        // hard Gates2 therefore resumes steering from the last hard Gates2
+        // that occupied this physical slot (112 in slot 2 at frame 11654 of
+        // the level-32 replay), rather than from angle zero.
+        entity.steerAngle = staleSteerAngle;
+      }
       if (kind == EntityKind::Effect) {
         entity.vx = staleVx;
         entity.vy = staleVy;
@@ -708,13 +863,10 @@ void Gates32::dispatchAnimeEvent(Entity& entity, int event, int) {
   if (entity.kind == EntityKind::Gates2) {
     if (event == 0x10000) {
       entity.mode = 1;
-      entity.timer = 0;
-      entity.aux = 0;
+      entity.scriptPc = 0;
     } else if (event == 0x10001) {
       entity.mode = 2;
-      entity.timer = 0;
-      entity.aux = 0;
-      entity.cycle = 0;
+      entity.scriptPc = 0;
     }
   }
   // FUN_004056f0: event 1 freezes a generic NAnime object and cancels its script.
@@ -896,7 +1048,7 @@ void Gates32::startGame(uint32_t seed, int randomIndex) {
   if (traceActive_) {
     stateTrace_ = traceCompact_
         ? "frame,input,random_index,player_x,player_y,lives,score,level,world_objects,anime,shots,particles,enemy_manager_count,stage_state,stage_counter,stage_countdown,stage_period,anime_manager_count,particle_manager_count,bombs_hash,state_hash\n"
-        : "frame,input,random_index,player_x,player_y,lives,score,level,world_objects,anime,shots,particles,world_head,anime_head,shots_head,particles_head,world_all,anime_all,shots_all,particles_all,shots_meta,world_slots,bombs_all,enemy_manager_count,stage_state,stage_counter,stage_countdown,stage_period,anime_manager_count,particle_manager_count,bombs_hash,state_hash\n";
+        : "frame,input,random_index,player_x,player_y,lives,score,level,world_objects,anime,shots,particles,world_head,anime_head,shots_head,particles_head,world_all,anime_all,shots_all,particles_all,shots_meta,world_slots,bombs_all,enemy_meta,bullet_meta,enemy_manager_count,stage_state,stage_counter,stage_countdown,stage_period,anime_manager_count,particle_manager_count,bombs_hash,state_hash\n";
   }
   screen_ = Screen::Playing;
   SDL_PauseAudioDevice(audioDevice_, 0);
@@ -998,6 +1150,9 @@ uint8_t Gates32::readLiveInputMask() const {
 }
 
 uint8_t Gates32::readInputMask() {
+#ifdef GATES32_HEADLESS
+  if (forcedInputActive_) return forcedInput_;
+#endif
   if (replayPlayback_) {
     // The original replay callback returns to the title as soon as live input
     // is detected, and also does so after consuming the playback sentinel.
@@ -1011,7 +1166,8 @@ uint8_t Gates32::readInputMask() {
     const size_t playbackFrames = replayInput_.size();
     if (replayPosition_ < playbackFrames) {
       const uint8_t value = replayInput_[replayPosition_++];
-      if (traceActive_ && replayPosition_ == playbackFrames) publishTraceAfterFrame_ = true;
+      if (traceActive_ && !traceEndStates_ && replayPosition_ == playbackFrames)
+        publishTraceAfterFrame_ = true;
       return value;
     }
     return 0;
@@ -1324,7 +1480,9 @@ void Gates32::updatePlayer(uint8_t input) {
   playerX_ = std::clamp(playerX_, 0, 383 * kOne);
   playerY_ = std::clamp(playerY_, 0, 391 * kOne);
 
-  if (invulnerable_ > 0) --invulnerable_;
+  // FUN_00405170 tests the old value first. A remaining value of 1 protects
+  // this entire collision pass and is only decremented to 0 in the else
+  // branch, so vulnerability resumes on the following frame.
   if (invulnerable_ <= 0) {
     for (Entity& bullet : enemyBullets_) {
       if (!bullet.active || !bullet.collidable || !intersectsPlayer(bullet)) continue;
@@ -1341,6 +1499,8 @@ void Gates32::updatePlayer(uint8_t input) {
       playSound(5);
       break;
     }
+  } else {
+    --invulnerable_;
   }
 
 }
@@ -1382,10 +1542,12 @@ Entity* Gates32::spawnEnemy(EntityKind kind, int x, int y, int angle, double spe
       break;
     case EntityKind::Gates2:
       enemy->sprite = 769; enemy->hp = enemy->initialHp = 20; enemy->timer = 0;
-      // FUN_004070c0 seeds +0x3a with the initial player-facing angle. Mode 0
-      // later uses its low nibble as the 16-volley long-pause counter before
-      // incrementing it; it is not a zero-based shot count.
-      enemy->phase = angle;
+      // FUN_004071c0 is the event-1 constructor and runs before the random
+      // edge spawner writes the new position. It therefore seeds +0x3a from
+      // the reused slot's old integer coordinates. Mode 0 later uses its low
+      // nibble as the 16-volley long-pause counter before incrementing it.
+      enemy->phase = aimAngle(fixedToInt(playerX_) - allocationX + 26,
+                              fixedToInt(playerY_) - allocationY + 35);
       enemy->slotData30 = (1 << 16) | static_cast<uint16_t>(enemy->hp);
       break;
     default: break;
@@ -1610,7 +1772,14 @@ void Gates32::hitEnemyBullet(Entity& bullet) {
 }
 
 void Gates32::hitEnemy(Entity& enemy, const Entity* impact, int damage) {
-  if (enemy.kind == EntityKind::Gates1 || enemy.kind == EntityKind::Gates2) addScore(1);
+  const bool gates = enemy.kind == EntityKind::Gates1 || enemy.kind == EntityKind::Gates2;
+  if (gates) {
+    addScore(1);
+    // FUN_00406c90/FUN_00406f90 and FUN_00407820 request the Gates impact
+    // sound for every damaging hit, before the caller requests sound 2 for
+    // the projectile impact animation.  It is not limited to the death hit.
+    playSound(4);
+  }
   enemy.hp -= damage;
   // Only Gates types store HP at +0x30. Enemy1/Enemy2 are one-hit objects;
   // their event-0x100 handlers clear the type without touching the angle byte.
@@ -1662,13 +1831,16 @@ void Gates32::killEnemy(Entity& enemy) {
     enemy.x = withIntegerPart(enemy.x, x - 6);
     enemy.y = withIntegerPart(enemy.y, y + 3);
     enemy.scriptPc = kScriptGatesDeath;
-    enemy.animeDelay = 0;
+    // FUN_00407820 replaces +0x2c but deliberately preserves +0x28. A boss
+    // killed during a mode animation therefore carries its remaining delay
+    // into the first command of the death script.
   } else {
     // FUN_004069d0/FUN_00406b90: 32 ticks, one trail child per four ticks,
     // using the destroyed object's velocity multiplied by six.
     spawnTrailEmitter(x, y, enemy.vx * 6, enemy.vy * 6, 32);
   }
-  playSound(enemy.kind == EntityKind::Gates1 || enemy.kind == EntityKind::Gates2 ? 4 : 3);
+  if (enemy.kind != EntityKind::Gates1 && enemy.kind != EntityKind::Gates2)
+    playSound(3);
   if (enemy.kind != EntityKind::Gates1 && enemy.kind != EntityKind::Gates2)
     enemy.active = false;
 }
@@ -1697,7 +1869,9 @@ void Gates32::updateEnemies() {
       enemy.vy = -enemy.vy;
     }
   };
-  for (Entity& enemy : enemies_) {
+  for (size_t enemyIndex = 0; enemyIndex < enemies_.size(); ++enemyIndex) {
+    Entity& enemy = enemies_[enemyIndex];
+    audioTraceSource_ = static_cast<int>(enemyIndex);
     if (!enemy.active) continue;
     // FUN_004065a0 counts records before invoking their callbacks. An enemy
     // cleared by movement or a collision later in this frame therefore keeps
@@ -1742,16 +1916,6 @@ void Gates32::updateEnemies() {
       clampHardEnemy(enemy);
     }
     const int x = fixedToInt(enemy.x), y = fixedToInt(enemy.y);
-    if (enemy.hard) {
-      const int target = aimAngle(px - x - 20, py - y - 40);
-      int delta = ((target - enemy.steerAngle + 128) & 255) - 128;
-      // 004074d1 uses the same unsigned CMP/SBB idiom as Enemy2. There is no
-      // stationary equality case: exact alignment selects the +2 branch.
-      enemy.steerAngle = clampAngle(enemy.steerAngle + (delta >= 0 ? 2 : -2));
-      enemy.vx = velocityX16(enemy.steerAngle, 3.0);
-      enemy.vy = velocityY16(enemy.steerAngle, 3.0);
-    }
-
     if ((enemy.kind != EntityKind::Gates2 || enemy.mode == 0) && --enemy.timer < 0) {
       if (enemy.kind == EntityKind::Enemy1) {
         spawnEnemyBullet(x + 2, y + 20, enemy.angle, 1.0);
@@ -1797,9 +1961,16 @@ void Gates32::updateEnemies() {
 
     // Gates2 modes 1 and 2 have their own counters and do not use the simple
     // fire branch above (FUN_00407230).
+    bool skipHardSteering = false;
     if (enemy.kind == EntityKind::Gates2 && enemy.mode == 1) {
       ++enemy.aux;
-      if (enemy.aux >= 0 && --enemy.timer < 0) {
+      if (enemy.aux >= 0) {
+        --enemy.timer;
+        // 0040724e jumps straight to the function epilogue while the wait
+        // timer is non-negative, bypassing the hard-mode steering tail.
+        skipHardSteering = enemy.timer >= 0;
+      }
+      if (enemy.aux >= 0 && enemy.timer < 0) {
         const int a = aimAngle(px - x - 27, py - y - 38);
         // The non-hard mode waits until the player is at least 64 pixels away
         // on both axes and within the forward angular quadrant. A failed test
@@ -1868,6 +2039,16 @@ void Gates32::updateEnemies() {
       }
     }
 
+    if (enemy.hard && !skipHardSteering) {
+      const int target = aimAngle(px - x - 20, py - y - 40);
+      int delta = ((target - enemy.steerAngle + 128) & 255) - 128;
+      // 004073d4..e2 has no stationary equality case: exact alignment takes
+      // the +2 branch after the unsigned CMP/SBB sequence.
+      enemy.steerAngle = clampAngle(enemy.steerAngle + (delta >= 0 ? 2 : -2));
+      enemy.vx = velocityX16(enemy.steerAngle, 3.0);
+      enemy.vy = velocityY16(enemy.steerAngle, 3.0);
+    }
+
     if (enemy.kind == EntityKind::Enemy2) {
       const int target = aimAngle(px - x - 7, py - y - 22);
       int delta = ((target - enemy.angle + 128) & 255) - 128;
@@ -1905,6 +2086,7 @@ void Gates32::updateEnemies() {
       enemy.active = false;
     }
   }
+  audioTraceSource_ = -1;
   enemyManagerCount_ = encountered;
 }
 
@@ -2089,15 +2271,15 @@ void Gates32::updateEffects(bool bombPool) {
         }
         effect.x += effect.vx;
         effect.y += effect.vy;
-        // FUN_00409190 finishes with FUN_004060d0, whose point-like mover
-        // clamps the integer word to the viewport and reflects velocity while
-        // preserving the 16-bit coordinate fraction.
+        // FUN_00409190 finishes with FUN_004061d0 in the DirectX build. Its
+        // x bound comes from the 640px software framebuffer, not the 384px
+        // playable/rendered area. The y bound remains the 400px framebuffer.
         int x = fixedToInt(effect.x);
         if (x < 0) {
           effect.x = withIntegerPart(effect.x, 0);
           effect.vx = -effect.vx;
-        } else if (x >= kWidth) {
-          effect.x = withIntegerPart(effect.x, kWidth - 1);
+        } else if (x >= kDirectXEffectBounceWidth) {
+          effect.x = withIntegerPart(effect.x, kDirectXEffectBounceWidth - 1);
           effect.vx = -effect.vx;
         }
         int y = fixedToInt(effect.y);
@@ -2187,9 +2369,6 @@ void Gates32::updateEffects(bool bombPool) {
         }
         break;
     }
-    if (!effect.active) continue;
-    const int x = fixedToInt(effect.x), y = fixedToInt(effect.y);
-    if (x < -96 || x > kWidth + 96 || y < -96 || y > kHeight + 96) effect.active = false;
     if (effect.active) ++encountered;
   }
   if (bombPool) bombEffectManagerCount_ = encountered;
@@ -2423,6 +2602,39 @@ void Gates32::appendStateTrace(uint8_t input) {
                 stateText(stateOf(effect, 0x90, false));
   }
   stateTrace_ += bombsAll.empty() ? "-," : bombsAll + ',';
+  std::string enemyMeta;
+  for (size_t index = 0; index < enemies_.size(); ++index) {
+    const Entity& enemy = enemies_[index];
+    if (!enemy.active) continue;
+    if (!enemyMeta.empty()) enemyMeta += '|';
+    enemyMeta += std::to_string(index) + ':' + std::to_string(typeOf(enemy)) + ':' +
+                 std::to_string(enemy.x) + ':' + std::to_string(enemy.y) + ':' +
+                 std::to_string(enemy.slotData30) + ':' + std::to_string(enemy.timer) + ':' +
+                 std::to_string(enemy.phase) + ':' + std::to_string(enemy.mode) + ':' +
+                 std::to_string(enemy.angle) + ':' + std::to_string(enemy.steerAngle) + ':' +
+                 std::to_string(enemy.aux) + ':' + std::to_string(enemy.cycle) + ':' +
+                 std::to_string(enemy.hard ? 1 : 0) + ':' +
+                 std::to_string(enemy.bounce ? 1 : 0) + ':' +
+                 std::to_string(enemy.modeLocked ? 1 : 0) + ':' +
+                 std::to_string(enemy.hp) + ':' + std::to_string(enemy.initialHp);
+  }
+  stateTrace_ += enemyMeta.empty() ? "-," : enemyMeta + ',';
+  std::string bulletMeta;
+  for (size_t index = 0; index < enemyBullets_.size(); ++index) {
+    const Entity& bullet = enemyBullets_[index];
+    if (!bullet.active) continue;
+    if (!bulletMeta.empty()) bulletMeta += '|';
+    const int signedType = bullet.collidable ? typeOf(bullet) : -typeOf(bullet);
+    bulletMeta += std::to_string(index) + ':' + std::to_string(signedType) + ':' +
+                  std::to_string(bullet.x) + ':' + std::to_string(bullet.y) + ':' +
+                  std::to_string(bullet.sprite) + ':' +
+                  std::to_string(bullet.animeDelay) + ':' +
+                  std::to_string(bullet.scriptPc
+                                     ? static_cast<int32_t>(bullet.scriptPc - kRuntimeBase)
+                                     : 0) + ':' +
+                  std::to_string(static_cast<int>(bullet.callback));
+  }
+  stateTrace_ += bulletMeta.empty() ? "-," : bulletMeta + ',';
   stateTrace_ += std::to_string(enemyManagerCount_) + ',';
   stateTrace_ += std::to_string(stageState_) + ',';
   stateTrace_ += std::to_string(stageCounter_) + ',';
@@ -2461,6 +2673,34 @@ void Gates32::publishStateTrace() {
       status.dataset.traceRows = String(Math.max(0, window.gates32StateTrace.split('\n').length - 2));
     }
   }, stateTrace_.c_str());
+#endif
+}
+
+void Gates32::publishAudioEventTrace() {
+  if (!audioTraceEnabled_ || audioEventTrace_.empty()) return;
+#ifdef __EMSCRIPTEN__
+  EM_ASM({
+    window.gates32AudioEventTrace = UTF8ToString($0);
+    var traceNode = document.getElementById('gates32-audio-event-trace');
+    if (!traceNode) {
+      traceNode = document.createElement('script');
+      traceNode.id = 'gates32-audio-event-trace';
+      traceNode.type = 'text/csv';
+      traceNode.hidden = true;
+      document.body.appendChild(traceNode);
+    }
+    traceNode.textContent = window.gates32AudioEventTrace;
+    var rows = Math.max(0, window.gates32AudioEventTrace.split('\n').length - 2);
+    if (window.gates32Diagnostics) {
+      window.gates32Diagnostics.audioTraceRows = rows;
+      window.gates32Diagnostics.audioTraceReady = true;
+    }
+    var status = document.getElementById('status');
+    if (status) {
+      status.dataset.audioTraceReady = 'true';
+      status.dataset.audioTraceRows = String(rows);
+    }
+  }, audioEventTrace_.c_str());
 #endif
 }
 
@@ -2551,10 +2791,15 @@ void Gates32::update() {
   updateParticles();
   updateEnemyBullets();
   updateEffects();
-  updatePlayer(input);
-  updatePlayerShots();
-  // The bomb records live in the player's child manager. Newly spawned bomb
-  // objects receive their first callback in this same player-update pass.
+  // FUN_00405070 guards the player and its shot manager as one block. Once
+  // stock becomes -1 (or the clear sentinel reaches 24), existing shots stay
+  // frozen. The bomb manager is dispatched separately and keeps running.
+  if (lives_ >= 0 && lives_ < 24) {
+    updatePlayer(input);
+    updatePlayerShots();
+  }
+  // Newly spawned bomb records receive their first callback in this same root
+  // pass and continue scoring during the clear/game-over grace period.
   updateEffects(true);
   updateStage();
   ++frameNumber_;
@@ -2755,20 +3000,57 @@ void Gates32::render() {
   SDL_RenderPresent(renderer_);
 }
 
+bool Gates32::readReplayFile(const char* path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return false;
+
+  ReplayHeader header{};
+  input.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (!input) return false;
+
+  std::vector<uint8_t> payload{std::istreambuf_iterator<char>(input),
+                               std::istreambuf_iterator<char>()};
+  // The original format is a 16-byte little-endian header followed by one
+  // input byte per frame. Reject truncated or implausibly large dropped files
+  // before replacing the currently usable replay.
+  constexpr uint32_t kMaxReplayFrames = 40u * 60u * 60u * 24u;
+  if (header.length == 0 || header.length > payload.size() ||
+      header.length > kMaxReplayFrames) {
+    return false;
+  }
+  payload.resize(header.length);
+  replayHeader_ = header;
+  replayInput_ = std::move(payload);
+  return true;
+}
+
+bool Gates32::loadReplayFile(const char* path) {
+  if (!readReplayFile(path)) return false;
+  startReplay(false);
+  return replayPlayback_;
+}
+
 void Gates32::loadBundledReplay() {
   const char* replayPath = "/assets/original/gates32.rep";
 #ifdef __EMSCRIPTEN__
-  if (EM_ASM_INT({
+  const int bundledQuery = EM_ASM_INT({
+    if (window.gates32QueryReplayBundled === 'gates32_clear_lv32.rep') return 2;
+    if (window.gates32QueryReplayBundled === 'gates32.rep') return 1;
+    return 0;
+  });
+  if (bundledQuery == 2) {
+    replayPath = "/assets/original/gates32_clear_lv32.rep";
+  } else if (bundledQuery == 1) {
+    replayPath = "/assets/original/gates32.rep";
+  } else if (EM_ASM_INT({ return window.gates32QueryReplayReady ? 1 : 0; })) {
+    replayPath = "/query.rep";
+  } else if (EM_ASM_INT({
         return new URLSearchParams(location.search).get('replay') === 'clear-lv32' ? 1 : 0;
       })) {
     replayPath = "/assets/original/gates32_clear_lv32.rep";
   }
 #endif
-  std::ifstream input(replayPath, std::ios::binary);
-  if (!input) return;
-  input.read(reinterpret_cast<char*>(&replayHeader_), sizeof(replayHeader_));
-  replayInput_.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-  if (replayHeader_.length && replayHeader_.length < replayInput_.size()) replayInput_.resize(replayHeader_.length);
+  readReplayFile(replayPath);
 }
 
 void Gates32::saveReplay() {
@@ -2791,6 +3073,868 @@ void Gates32::saveReplay() {
 #endif
 }
 
+#ifdef GATES32_HEADLESS
+bool Gates32::initializeHeadless(const char* assetRoot) {
+  assetRoot_ = assetRoot && *assetRoot ? assetRoot : "assets";
+  soundEnabled_ = false;
+  audioDevice_ = 0;
+  if (!loadSpriteInfo()) {
+    std::cerr << "Could not load " << assetPath("runtime/sprites.dat") << '\n';
+    return false;
+  }
+  if (!loadMathTables()) {
+    std::cerr << "Could not load " << assetPath("runtime/runtime-common.bin") << '\n';
+    return false;
+  }
+  return true;
+}
+
+Gates32::SimulationState Gates32::captureSimulationState() const {
+  SimulationState state;
+  state.enemies = enemies_;
+  state.enemyBullets = enemyBullets_;
+  state.playerShots = playerShots_;
+  state.effects = effects_;
+  state.bombEffects = bombEffects_;
+  state.particles = particles_;
+  state.enemyCachedBottomRight = enemyCachedBottomRight_;
+  state.worldCapacity = worldCapacity_;
+  state.enemyManagerCount = enemyManagerCount_;
+  state.enemyBulletManagerCount = enemyBulletManagerCount_;
+  state.effectManagerCount = effectManagerCount_;
+  state.bombEffectManagerCount = bombEffectManagerCount_;
+  state.particleManagerCount = particleManagerCount_;
+  state.effectOverflow = effectOverflow_;
+  state.screen = screen_;
+  state.frameNumber = frameNumber_;
+  state.playerX = playerX_;
+  state.playerY = playerY_;
+  state.lives = lives_;
+  state.invulnerable = invulnerable_;
+  state.shotCooldown = shotCooldown_;
+  state.piercingShotsEnabled = piercingShotsEnabled_;
+  state.score = score_;
+  state.highScore = highScore_;
+  state.nextOneUp = nextOneUp_;
+  state.deflation = deflation_;
+  state.level = level_;
+  state.endTimer = endTimer_;
+  state.endStartFrame = endStartFrame_;
+  state.scoreSubmitted = scoreSubmitted_;
+  state.stageState = stageState_;
+  state.stageCounter = stageCounter_;
+  state.stageCountdown = stageCountdown_;
+  state.stagePeriod = stagePeriod_;
+  state.randomSeed = randomSeed_;
+  state.randomIndex = randomIndex_;
+  state.randomTable = randomTable_;
+  return state;
+}
+
+void Gates32::restoreSimulationState(const SimulationState& state) {
+  enemies_ = state.enemies;
+  enemyBullets_ = state.enemyBullets;
+  playerShots_ = state.playerShots;
+  effects_ = state.effects;
+  bombEffects_ = state.bombEffects;
+  particles_ = state.particles;
+  enemyCachedBottomRight_ = state.enemyCachedBottomRight;
+  worldCapacity_ = state.worldCapacity;
+  enemyManagerCount_ = state.enemyManagerCount;
+  enemyBulletManagerCount_ = state.enemyBulletManagerCount;
+  effectManagerCount_ = state.effectManagerCount;
+  bombEffectManagerCount_ = state.bombEffectManagerCount;
+  particleManagerCount_ = state.particleManagerCount;
+  effectOverflow_ = state.effectOverflow;
+  screen_ = state.screen;
+  frameNumber_ = state.frameNumber;
+  playerX_ = state.playerX;
+  playerY_ = state.playerY;
+  lives_ = state.lives;
+  invulnerable_ = state.invulnerable;
+  shotCooldown_ = state.shotCooldown;
+  piercingShotsEnabled_ = state.piercingShotsEnabled;
+  score_ = state.score;
+  highScore_ = state.highScore;
+  nextOneUp_ = state.nextOneUp;
+  deflation_ = state.deflation;
+  level_ = state.level;
+  endTimer_ = state.endTimer;
+  endStartFrame_ = state.endStartFrame;
+  scoreSubmitted_ = state.scoreSubmitted;
+  stageState_ = state.stageState;
+  stageCounter_ = state.stageCounter;
+  stageCountdown_ = state.stageCountdown;
+  stagePeriod_ = state.stagePeriod;
+  randomSeed_ = state.randomSeed;
+  randomIndex_ = state.randomIndex;
+  randomTable_ = state.randomTable;
+  replayPlayback_ = false;
+  replayRecording_ = false;
+  replaySession_ = true;
+  traceActive_ = false;
+  publishTraceAfterFrame_ = false;
+  forcedInputActive_ = false;
+}
+
+void Gates32::updateForced(uint8_t input) {
+  forcedInput_ = input;
+  forcedInputActive_ = true;
+  update();
+  forcedInputActive_ = false;
+}
+
+int64_t Gates32::solverEvaluation() const {
+  constexpr int64_t kTerminal = 4'000'000'000'000'000LL;
+  if (lives_ > 23 || score_ > 99'999'998 || level_ > 31)
+    return kTerminal + static_cast<int64_t>(score_) * 100'000;
+  if (lives_ < 0) return -kTerminal + static_cast<int64_t>(score_) * 100'000;
+
+  int nearestBullet = 4096;
+  const int px = fixedToInt(playerX_);
+  const int py = fixedToInt(playerY_);
+  for (const Entity& bullet : enemyBullets_) {
+    if (!bullet.active || !bullet.collidable) continue;
+    const int dx = fixedToInt(bullet.x) - px;
+    const int dy = fixedToInt(bullet.y) - py;
+    nearestBullet = std::min(nearestBullet, dx * dx + dy * dy);
+  }
+  const int centerBias = 384 - std::abs(px - 192);
+  return static_cast<int64_t>(score_) * 100'000 +
+         static_cast<int64_t>(level_) * 100'000'000'000LL +
+         static_cast<int64_t>(lives_) * 1'000'000'000'000LL +
+         static_cast<int64_t>(stageState_) * 100'000'000 +
+         static_cast<int64_t>(stageCounter_) * 10'000 +
+         static_cast<int64_t>(nearestBullet) * 100'000 +
+         static_cast<int64_t>(centerBias) * 1'000;
+}
+
+int Gates32::runHeadlessSolver(int argc, char** argv) {
+  struct Options {
+    std::string output = "gates32-solved.rep";
+    std::string guide;
+    uint32_t seed = 1;
+    uint32_t randomIndex = 0;
+    int seeds = 1;
+    size_t frames = 12'500;
+    size_t beam = 24;
+    size_t hold = 6;
+    size_t reportEvery = 100;
+    size_t threads = 0;
+    int maxHits = std::numeric_limits<int>::max();
+    int targetLives = 0;
+    size_t repairAttempts = 0;
+    size_t rollbackFrames = 320;
+    size_t repairAhead = 160;
+    bool repairOnly = false;
+    bool explosion = true;
+    bool explosionExplicit = false;
+    bool acchoh = false;
+    bool acchohExplicit = false;
+    bool quiet = false;
+  } options;
+
+  auto usage = [&]() {
+    std::cout
+        << "Gates32 native score solver\n\n"
+        << "Usage: gates32_solver.exe [options]\n"
+        << "  --output FILE       output replay (default gates32-solved.rep)\n"
+        << "  --assets DIR        asset directory (default assets)\n"
+        << "  --guide FILE        retain this successful replay as a search branch\n"
+        << "  --seed N            first replay seed (default 1)\n"
+        << "  --seeds N           number of consecutive seeds to search\n"
+        << "  --random-index N    initial random-table cursor\n"
+        << "  --frames N          maximum recorded input frames (default 12500)\n"
+        << "  --beam N            states retained at each branch (default 24)\n"
+        << "  --hold N            frames per chosen input mask (default 6)\n"
+        << "  --report N          progress interval in decisions (default 100)\n"
+        << "  --threads N         worker threads (default auto, at most 16)\n"
+        << "  --max-hits N        reject paths after more than N player hits\n"
+        << "  --target-lives N    require a clear with at least N remaining lives\n"
+        << "  --repair N          iteratively repair up to N death/frontier points\n"
+        << "  --rollback N        frames rewound before each death (default 320)\n"
+        << "  --repair-ahead N    survive N frames beyond each death (default 160)\n"
+        << "  --repair-only       write the repaired guide without a global pass\n"
+        << "  --explode           enable EXPLODE, overriding guide flags\n"
+        << "  --no-explode        disable EXPLODE, overriding guide flags\n"
+        << "  --acchoh            enable ACCHOH, overriding guide flags\n"
+        << "  --no-acchoh         disable ACCHOH, overriding guide flags\n"
+        << "  --quiet             suppress progress lines\n";
+  };
+  auto parseUnsigned = [&](const char* name, const char* text) -> uint64_t {
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 0);
+    if (!text[0] || !end || *end) {
+      std::cerr << "Invalid value for " << name << ": " << text << '\n';
+      std::exit(2);
+    }
+    return static_cast<uint64_t>(value);
+  };
+  for (int i = 1; i < argc; ++i) {
+    const std::string argument = argv[i];
+    auto value = [&]() -> const char* {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value after " << argument << '\n';
+        std::exit(2);
+      }
+      return argv[++i];
+    };
+    if (argument == "--help" || argument == "-h") { usage(); return 0; }
+    if (argument == "--output" || argument == "-o") options.output = value();
+    else if (argument == "--assets") { (void)value(); }
+    else if (argument == "--guide") options.guide = value();
+    else if (argument == "--seed") options.seed = static_cast<uint32_t>(parseUnsigned("--seed", value()));
+    else if (argument == "--seeds") options.seeds = static_cast<int>(parseUnsigned("--seeds", value()));
+    else if (argument == "--random-index") options.randomIndex = static_cast<uint32_t>(parseUnsigned("--random-index", value()));
+    else if (argument == "--frames") options.frames = static_cast<size_t>(parseUnsigned("--frames", value()));
+    else if (argument == "--beam") options.beam = static_cast<size_t>(parseUnsigned("--beam", value()));
+    else if (argument == "--hold") options.hold = static_cast<size_t>(parseUnsigned("--hold", value()));
+    else if (argument == "--report") options.reportEvery = static_cast<size_t>(parseUnsigned("--report", value()));
+    else if (argument == "--threads") options.threads = static_cast<size_t>(parseUnsigned("--threads", value()));
+    else if (argument == "--max-hits") options.maxHits = static_cast<int>(parseUnsigned("--max-hits", value()));
+    else if (argument == "--target-lives") options.targetLives = static_cast<int>(parseUnsigned("--target-lives", value()));
+    else if (argument == "--repair") options.repairAttempts = static_cast<size_t>(parseUnsigned("--repair", value()));
+    else if (argument == "--rollback") options.rollbackFrames = static_cast<size_t>(parseUnsigned("--rollback", value()));
+    else if (argument == "--repair-ahead") options.repairAhead = static_cast<size_t>(parseUnsigned("--repair-ahead", value()));
+    else if (argument == "--repair-only") options.repairOnly = true;
+    else if (argument == "--explode") { options.explosion = true; options.explosionExplicit = true; }
+    else if (argument == "--no-explode") { options.explosion = false; options.explosionExplicit = true; }
+    else if (argument == "--acchoh") { options.acchoh = true; options.acchohExplicit = true; }
+    else if (argument == "--no-acchoh") { options.acchoh = false; options.acchohExplicit = true; }
+    else if (argument == "--quiet") options.quiet = true;
+    else {
+      std::cerr << "Unknown option: " << argument << '\n';
+      usage();
+      return 2;
+    }
+  }
+  if (options.frames == 0 || options.frames > std::numeric_limits<uint32_t>::max() ||
+      options.beam == 0 || options.hold == 0 || options.seeds < 1 || options.seeds > 4096) {
+    std::cerr << "frames, beam, hold and seeds must be positive and within range\n";
+    return 2;
+  }
+  if (options.repairOnly && options.repairAttempts == 0) {
+    std::cerr << "--repair-only requires --repair N\n";
+    return 2;
+  }
+  if (options.threads == 0) {
+    const unsigned detected = std::thread::hardware_concurrency();
+    options.threads = std::max<size_t>(1, std::min<size_t>(16, detected ? detected : 1));
+  }
+  if (options.threads > 256) {
+    std::cerr << "--threads must be between 1 and 256\n";
+    return 2;
+  }
+  if (options.maxHits < 0 || options.targetLives < 0 || options.targetLives > 24) {
+    std::cerr << "--max-hits and --target-lives must be within range\n";
+    return 2;
+  }
+
+  struct SolverNode {
+    SimulationState state;
+    std::vector<uint8_t> input;
+    uint32_t seed = 1;
+    int64_t evaluation = 0;
+    uint64_t hash = 0;
+    bool followsGuide = false;
+  };
+
+  ReplayHeader guideHeader{};
+  std::vector<uint8_t> guideInput;
+  if (!options.guide.empty()) {
+    std::ifstream guide(options.guide, std::ios::binary);
+    if (!guide) {
+      std::cerr << "Could not open guide replay: " << options.guide << '\n';
+      return 2;
+    }
+    guide.read(reinterpret_cast<char*>(&guideHeader), sizeof(guideHeader));
+    if (!guide || guideHeader.length > 40u * 60u * 60u * 24u) {
+      std::cerr << "Invalid guide replay header: " << options.guide << '\n';
+      return 2;
+    }
+    guideInput.resize(guideHeader.length);
+    guide.read(reinterpret_cast<char*>(guideInput.data()),
+               static_cast<std::streamsize>(guideInput.size()));
+    if (guide.gcount() != static_cast<std::streamsize>(guideInput.size())) {
+      std::cerr << "Truncated guide replay: " << options.guide << '\n';
+      return 2;
+    }
+    options.seed = guideHeader.seed ? guideHeader.seed : 1;
+    options.randomIndex = guideHeader.randomIndex;
+    options.seeds = 1;
+    if (!options.explosionExplicit)
+      options.explosion = (guideHeader.modeFlags & 4u) != 0;
+    if (!options.acchohExplicit)
+      options.acchoh = (guideHeader.modeFlags & 8u) != 0;
+    if (options.frames < guideInput.size()) options.frames = guideInput.size();
+  }
+
+  explosionMode_ = options.explosion;
+  acchohMode_ = options.acchoh;
+  soundEnabled_ = false;
+  std::vector<SolverNode> beam;
+  beam.reserve(options.beam);
+  for (int seedOffset = 0; seedOffset < options.seeds; ++seedOffset) {
+    uint32_t seed = options.seed + static_cast<uint32_t>(seedOffset);
+    if (seed == 0) seed = 1;
+    replayPlayback_ = true;
+    startGame(seed, static_cast<int>(options.randomIndex));
+    replayPlayback_ = false;
+    replaySession_ = true;
+    SolverNode node;
+    node.state = captureSimulationState();
+    node.seed = seed;
+    node.evaluation = solverEvaluation();
+    node.hash = stateHash(0) ^ (static_cast<uint64_t>(seed) << 32);
+    node.followsGuide = !guideInput.empty();
+    beam.push_back(std::move(node));
+  }
+  std::sort(beam.begin(), beam.end(), [](const SolverNode& a, const SolverNode& b) {
+    return a.evaluation > b.evaluation;
+  });
+  if (beam.size() > options.beam) beam.resize(options.beam);
+
+  constexpr std::array<uint8_t, 9> directions = {
+      0x00, 0x02, 0x04, 0x08, 0x10, 0x06, 0x0a, 0x14, 0x18};
+  std::array<uint8_t, 18> actions{};
+  for (size_t i = 0; i < directions.size(); ++i) {
+    actions[i] = static_cast<uint8_t>(directions[i] | 0x20);
+    actions[i + directions.size()] = directions[i];
+  }
+
+  auto isClearState = [](const SimulationState& state) {
+    return state.lives > 23 || state.score > 99'999'998 || state.level > 31;
+  };
+  auto hitsTaken = [](const SimulationState& state) {
+    const int earnedLives = std::max(0, state.nextOneUp / 100000 - 1);
+    return std::max(0, 2 + earnedLives - state.lives);
+  };
+  auto isGoalState = [&](const SimulationState& state) {
+    return isClearState(state) && hitsTaken(state) <= options.maxHits &&
+           (options.targetLives == 0 || state.lives >= options.targetLives);
+  };
+  auto isFailedState = [&](const SimulationState& state) {
+    if (isGoalState(state)) return false;
+    return hitsTaken(state) > options.maxHits || isClearState(state) ||
+           state.lives < 0 || state.screen != Screen::Playing;
+  };
+  auto currentHitsTaken = [](const Gates32& game) {
+    const int earnedLives = std::max(0, game.nextOneUp_ / 100000 - 1);
+    return std::max(0, 2 + earnedLives - game.lives_);
+  };
+  auto isCurrentClear = [](const Gates32& game) {
+    return game.lives_ > 23 || game.score_ > 99'999'998 || game.level_ > 31;
+  };
+  auto isCurrentGoal = [&](const Gates32& game) {
+    return isCurrentClear(game) && currentHitsTaken(game) <= options.maxHits &&
+           (options.targetLives == 0 || game.lives_ >= options.targetLives);
+  };
+  auto isCurrentFailed = [&](const Gates32& game) {
+    if (isCurrentGoal(game)) return false;
+    return currentHitsTaken(game) > options.maxHits || isCurrentClear(game) ||
+           game.lives_ < 0 || game.screen_ != Screen::Playing;
+  };
+  auto startSolverGame = [&](uint32_t seed) {
+    explosionMode_ = options.explosion;
+    acchohMode_ = options.acchoh;
+    soundEnabled_ = false;
+    replayPlayback_ = true;
+    startGame(seed, static_cast<int>(options.randomIndex));
+    replayPlayback_ = false;
+    replaySession_ = true;
+  };
+  struct PlaybackResult {
+    SimulationState state;
+    size_t consumed = 0;
+    bool cleared = false;
+    bool goalReached = false;
+    bool failed = false;
+    bool dead = false;
+  };
+  auto playSequence = [&](const std::vector<uint8_t>& input, size_t limit,
+                          bool settle) {
+    startSolverGame(options.seed);
+    PlaybackResult result;
+    const size_t count = std::min(limit, input.size());
+    for (size_t index = 0; index < count; ++index) {
+      if (isCurrentGoal(*this) || isCurrentFailed(*this)) break;
+      updateForced(input[index]);
+      result.consumed = index + 1;
+      if (isCurrentGoal(*this) || isCurrentFailed(*this)) break;
+    }
+    result.state = captureSimulationState();
+    result.cleared = isClearState(result.state);
+    result.goalReached = isGoalState(result.state);
+    result.failed = isFailedState(result.state);
+    result.dead = result.state.lives < 0 && !result.cleared;
+    if (settle && (result.goalReached || result.dead || screen_ != Screen::Playing)) {
+      for (int guard = 0; guard < 400 && screen_ != Screen::Title; ++guard)
+        updateForced(0);
+      result.state = captureSimulationState();
+      result.cleared = isClearState(result.state);
+      result.goalReached = isGoalState(result.state);
+      result.failed = isFailedState(result.state);
+      result.dead = result.state.lives < 0 && !result.cleared;
+    }
+    return result;
+  };
+
+  struct WorkerPool {
+    using Job = std::function<void(Gates32&, size_t)>;
+
+    explicit WorkerPool(size_t count, const std::string& assetRoot) {
+      games.reserve(count);
+      for (size_t index = 0; index < count; ++index) {
+        auto game = std::make_unique<Gates32>();
+        if (!game->initializeHeadless(assetRoot.c_str())) return;
+        games.push_back(std::move(game));
+      }
+      workers.reserve(count);
+      for (size_t index = 0; index < count; ++index) {
+        workers.emplace_back([this, index]() {
+          size_t observedGeneration = 0;
+          for (;;) {
+            {
+              std::unique_lock<std::mutex> lock(mutex);
+              ready.wait(lock, [&]() {
+                return stopping || generation != observedGeneration;
+              });
+              if (stopping) return;
+              observedGeneration = generation;
+            }
+            for (;;) {
+              const size_t jobIndex = nextJob.fetch_add(1, std::memory_order_relaxed);
+              if (jobIndex >= jobCount) break;
+              job(*games[index], jobIndex);
+            }
+            {
+              std::lock_guard<std::mutex> lock(mutex);
+              if (++finishedWorkers == workers.size()) finished.notify_one();
+            }
+          }
+        });
+      }
+    }
+
+    ~WorkerPool() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopping = true;
+      }
+      ready.notify_all();
+      for (std::thread& worker : workers) if (worker.joinable()) worker.join();
+    }
+
+    bool valid(size_t expected) const {
+      return games.size() == expected && workers.size() == expected;
+    }
+
+    void run(size_t count, Job next) {
+      if (count == 0) return;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        job = std::move(next);
+        jobCount = count;
+        nextJob.store(0, std::memory_order_relaxed);
+        finishedWorkers = 0;
+        ++generation;
+      }
+      ready.notify_all();
+      std::unique_lock<std::mutex> lock(mutex);
+      finished.wait(lock, [&]() { return finishedWorkers == workers.size(); });
+    }
+
+    std::vector<std::unique_ptr<Gates32>> games;
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable finished;
+    std::atomic<size_t> nextJob{0};
+    Job job;
+    size_t jobCount = 0;
+    size_t finishedWorkers = 0;
+    size_t generation = 0;
+    bool stopping = false;
+  } workerPool(options.threads, assetRoot_);
+  if (!workerPool.valid(options.threads)) {
+    std::cerr << "Could not initialize solver worker threads\n";
+    return 2;
+  }
+  if (!options.quiet) std::cout << std::unitbuf;
+  if (!options.quiet) std::cout << "threads=" << options.threads << '\n';
+
+  if (options.repairAttempts != 0) {
+    if (guideInput.empty()) {
+      std::cerr << "--repair requires --guide FILE\n";
+      return 2;
+    }
+    std::vector<uint8_t> workingInput = guideInput;
+    size_t consecutiveFailures = 0;
+    PlaybackResult outcome = playSequence(workingInput, workingInput.size(), false);
+    if (!options.quiet) {
+      std::cout << "repair-start consumed=" << outcome.consumed
+                << " score=" << outcome.state.score
+                << " level=" << outcome.state.level
+                << " lives=" << outcome.state.lives
+                << " hits=" << hitsTaken(outcome.state)
+                << " cleared=" << (outcome.cleared ? "yes" : "no") << '\n';
+    }
+
+    for (size_t attempt = 0; attempt < options.repairAttempts && !outcome.goalReached; ++attempt) {
+      const bool frontier = !outcome.failed && outcome.consumed >= workingInput.size();
+      if (!outcome.failed && !frontier) break;
+      const size_t failureFrame = outcome.consumed;
+      const size_t rollbackMultiplier = size_t{1} << std::min<size_t>(consecutiveFailures, 3);
+      const size_t wantedRollback = options.rollbackFrames * rollbackMultiplier;
+      const size_t start = frontier ? failureFrame
+                                    : (failureFrame > wantedRollback ? failureFrame - wantedRollback : 0);
+      const size_t target = std::min(options.frames, failureFrame + options.repairAhead * rollbackMultiplier);
+      if (target <= start) break;
+
+      PlaybackResult prefix = playSequence(workingInput, start, false);
+      if (prefix.failed || prefix.goalReached || prefix.consumed != start) {
+        std::cerr << "Could not restore repair checkpoint at frame " << start << '\n';
+        break;
+      }
+
+      struct LocalNode {
+        SimulationState state;
+        std::vector<uint8_t> input;
+        int64_t evaluation = 0;
+      };
+      std::vector<LocalNode> localBeam;
+      localBeam.push_back({prefix.state, {}, 0});
+      restoreSimulationState(prefix.state);
+      localBeam.front().evaluation = solverEvaluation();
+      const size_t required = target - start;
+      const size_t localDecisions = (required + options.hold - 1) / options.hold;
+
+      auto localOrder = [](const LocalNode& a, const LocalNode& b) {
+        if (a.evaluation != b.evaluation) return a.evaluation > b.evaluation;
+        if (a.state.lives != b.state.lives) return a.state.lives > b.state.lives;
+        if (a.state.score != b.state.score) return a.state.score > b.state.score;
+        return a.state.level > b.state.level;
+      };
+
+      for (size_t localDecision = 0; localDecision < localDecisions; ++localDecision) {
+        struct LocalJob {
+          size_t parent = 0;
+          uint8_t action = 0;
+          bool useGuide = false;
+        };
+        std::vector<LocalNode> candidates;
+        candidates.reserve(localBeam.size() * (actions.size() + 1));
+        std::vector<LocalJob> jobs;
+        jobs.reserve(localBeam.size() * (actions.size() + 1));
+        bool expandable = false;
+        for (size_t parentIndex = 0; parentIndex < localBeam.size(); ++parentIndex) {
+          const LocalNode& parent = localBeam[parentIndex];
+          const bool goal = isGoalState(parent.state);
+          const bool failed = isFailedState(parent.state);
+          if (goal || failed || parent.input.size() >= required) {
+            candidates.push_back(parent);
+            continue;
+          }
+          expandable = true;
+          for (uint8_t action : actions) jobs.push_back({parentIndex, action, false});
+          jobs.push_back({parentIndex, 0, true});
+        }
+        if (!expandable || jobs.empty()) break;
+
+        const size_t carried = candidates.size();
+        candidates.resize(carried + jobs.size());
+        workerPool.run(jobs.size(), [&](Gates32& worker, size_t jobIndex) {
+          const LocalJob& work = jobs[jobIndex];
+          const LocalNode& parent = localBeam[work.parent];
+          worker.restoreSimulationState(parent.state);
+          LocalNode child;
+          child.input = parent.input;
+          for (size_t frame = 0; frame < options.hold && child.input.size() < required; ++frame) {
+            if (isCurrentGoal(worker) || isCurrentFailed(worker)) break;
+            const size_t absolute = start + child.input.size();
+            const uint8_t selected = work.useGuide && absolute < workingInput.size()
+                                         ? workingInput[absolute]
+                                         : work.action;
+            child.input.push_back(selected);
+            worker.updateForced(selected);
+            if (isCurrentGoal(worker) || isCurrentFailed(worker)) break;
+          }
+          child.state = worker.captureSimulationState();
+          child.evaluation = worker.solverEvaluation();
+          candidates[carried + jobIndex] = std::move(child);
+        });
+
+        const bool hasSurvivor = std::any_of(candidates.begin(), candidates.end(),
+                                             [&](const LocalNode& node) {
+          return !isFailedState(node.state) || isGoalState(node.state);
+        });
+        if (hasSurvivor) {
+          candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                          [&](const LocalNode& node) {
+            return isFailedState(node.state) && !isGoalState(node.state);
+          }), candidates.end());
+        }
+        std::sort(candidates.begin(), candidates.end(), localOrder);
+
+        // Reserve half of the beam for the best survivor in each life/position
+        // bucket. This prevents all candidates from converging on one locally
+        // attractive point that is hit by the same projectile a few ticks later.
+        std::vector<LocalNode> next;
+        next.reserve(options.beam);
+        std::vector<bool> selected(candidates.size(), false);
+        std::array<bool, 512> bucketUsed{};
+        const size_t diversityLimit = std::max<size_t>(1, options.beam / 2);
+        for (size_t index = 0; index < candidates.size() && next.size() < diversityLimit; ++index) {
+          const SimulationState& state = candidates[index].state;
+          const int lifeBucket = std::clamp(state.lives, 0, 7);
+          const int xBucket = std::clamp(fixedToInt(state.playerX) / 48, 0, 7);
+          const int yBucket = std::clamp(fixedToInt(state.playerY) / 50, 0, 7);
+          const size_t bucket = static_cast<size_t>((lifeBucket * 8 + yBucket) * 8 + xBucket);
+          if (bucketUsed[bucket]) continue;
+          bucketUsed[bucket] = true;
+          selected[index] = true;
+          next.push_back(std::move(candidates[index]));
+        }
+        for (size_t index = 0; index < candidates.size() && next.size() < options.beam; ++index) {
+          if (selected[index]) continue;
+          next.push_back(std::move(candidates[index]));
+        }
+        localBeam = std::move(next);
+      }
+
+      std::sort(localBeam.begin(), localBeam.end(), localOrder);
+      const auto survivor = std::find_if(localBeam.begin(), localBeam.end(),
+                                         [&](const LocalNode& node) {
+        return (!isFailedState(node.state) || isGoalState(node.state)) &&
+               (node.input.size() >= required || isGoalState(node.state));
+      });
+      if (survivor == localBeam.end()) {
+        ++consecutiveFailures;
+        if (!options.quiet)
+          std::cout << "repair=" << (attempt + 1) << " failed start=" << start
+                    << " target=" << target << '\n';
+        continue;
+      }
+
+      std::vector<uint8_t> candidateInput;
+      candidateInput.reserve(std::max(workingInput.size(), start + survivor->input.size()));
+      candidateInput.insert(candidateInput.end(), workingInput.begin(), workingInput.begin() + start);
+      candidateInput.insert(candidateInput.end(), survivor->input.begin(), survivor->input.end());
+      if (!isGoalState(survivor->state) && target < workingInput.size())
+        candidateInput.insert(candidateInput.end(), workingInput.begin() + target, workingInput.end());
+
+      PlaybackResult candidateOutcome = playSequence(candidateInput, candidateInput.size(), false);
+      const bool improved = candidateOutcome.goalReached || !candidateOutcome.failed ||
+                            candidateOutcome.consumed > failureFrame;
+      if (!improved) {
+        ++consecutiveFailures;
+        if (!options.quiet)
+          std::cout << "repair=" << (attempt + 1) << " no-gain old=" << failureFrame
+                    << " new=" << candidateOutcome.consumed << '\n';
+        continue;
+      }
+      workingInput = std::move(candidateInput);
+      outcome = std::move(candidateOutcome);
+      consecutiveFailures = 0;
+      if (!options.quiet) {
+        std::cout << "repair=" << (attempt + 1)
+                  << " old=" << failureFrame
+                  << " new=" << outcome.consumed
+                  << " score=" << outcome.state.score
+                  << " level=" << outcome.state.level
+                  << " lives=" << outcome.state.lives
+                  << " hits=" << hitsTaken(outcome.state)
+                  << " cleared=" << (outcome.cleared ? "yes" : "no") << '\n';
+      }
+    }
+    guideInput = std::move(workingInput);
+
+    if (options.repairOnly) {
+      PlaybackResult final = playSequence(guideInput, guideInput.size(), true);
+      SolverNode node;
+      node.seed = options.seed;
+      node.input.assign(guideInput.begin(), guideInput.begin() + final.consumed);
+      node.state = final.state;
+      restoreSimulationState(node.state);
+      node.evaluation = solverEvaluation();
+      node.hash = stateHash(0) ^ (static_cast<uint64_t>(node.seed) << 32) ^
+                  static_cast<uint64_t>(node.input.size());
+      node.followsGuide = true;
+      beam.clear();
+      beam.push_back(std::move(node));
+    }
+  }
+
+  const size_t maximumDecisions = options.repairOnly
+                                      ? 0
+                                      : (options.frames + options.hold - 1) / options.hold;
+  size_t decision = 0;
+  for (; decision < maximumDecisions; ++decision) {
+    struct GlobalJob {
+      size_t parent = 0;
+      uint8_t action = 0;
+      bool followGuide = false;
+    };
+    std::vector<SolverNode> candidates;
+    candidates.reserve(beam.size() * (actions.size() + 1));
+    std::vector<GlobalJob> jobs;
+    jobs.reserve(beam.size() * (actions.size() + 1));
+    bool anyExpandable = false;
+    for (size_t parentIndex = 0; parentIndex < beam.size(); ++parentIndex) {
+      const SolverNode& parent = beam[parentIndex];
+      const bool terminal = isGoalState(parent.state) || isFailedState(parent.state);
+      if (terminal || parent.input.size() >= options.frames) {
+        candidates.push_back(parent);
+        continue;
+      }
+      anyExpandable = true;
+      for (uint8_t action : actions) jobs.push_back({parentIndex, action, false});
+      if (parent.followsGuide) jobs.push_back({parentIndex, 0, true});
+    }
+    if (!anyExpandable) break;
+
+    const size_t carried = candidates.size();
+    candidates.resize(carried + jobs.size());
+    workerPool.run(jobs.size(), [&](Gates32& worker, size_t jobIndex) {
+      const GlobalJob& work = jobs[jobIndex];
+      const SolverNode& parent = beam[work.parent];
+      worker.restoreSimulationState(parent.state);
+      SolverNode child;
+      child.input = parent.input;
+      child.seed = parent.seed;
+      child.followsGuide = work.followGuide;
+      for (size_t frame = 0; frame < options.hold && child.input.size() < options.frames; ++frame) {
+        if (isCurrentGoal(worker) || isCurrentFailed(worker)) break;
+        const uint8_t selected = work.followGuide && child.input.size() < guideInput.size()
+                                     ? guideInput[child.input.size()]
+                                     : work.action;
+        child.input.push_back(selected);
+        worker.updateForced(selected);
+        if (isCurrentGoal(worker) || isCurrentFailed(worker)) break;
+      }
+      const SimulationState terminalState = worker.captureSimulationState();
+      if (isGoalState(terminalState) || terminalState.lives < 0 ||
+          terminalState.screen != Screen::Playing) {
+        for (int guard = 0; guard < 400 && worker.screen_ != Screen::Title; ++guard)
+          worker.updateForced(0);
+      }
+      child.state = worker.captureSimulationState();
+      child.evaluation = worker.solverEvaluation();
+      child.hash = worker.stateHash(work.action) ^ (static_cast<uint64_t>(child.seed) << 32) ^
+                   static_cast<uint64_t>(child.input.size());
+      candidates[carried + jobIndex] = std::move(child);
+    });
+
+    const bool hasViable = std::any_of(candidates.begin(), candidates.end(),
+                                       [&](const SolverNode& node) {
+      return !isFailedState(node.state) || isGoalState(node.state);
+    });
+    if (hasViable) {
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                      [&](const SolverNode& node) {
+        return isFailedState(node.state) && !isGoalState(node.state);
+      }), candidates.end());
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const SolverNode& a, const SolverNode& b) {
+      if (a.evaluation != b.evaluation) return a.evaluation > b.evaluation;
+      if (a.state.score != b.state.score) return a.state.score > b.state.score;
+      if (a.state.level != b.state.level) return a.state.level > b.state.level;
+      return a.hash < b.hash;
+    });
+    if (!guideInput.empty() && candidates.size() > options.beam) {
+      const auto guide = std::find_if(candidates.begin(), candidates.end(),
+                                      [](const SolverNode& node) { return node.followsGuide; });
+      if (guide != candidates.end() &&
+          static_cast<size_t>(std::distance(candidates.begin(), guide)) >= options.beam)
+        std::iter_swap(candidates.begin() + static_cast<std::ptrdiff_t>(options.beam - 1), guide);
+    }
+    beam.clear();
+    for (SolverNode& candidate : candidates) {
+      beam.push_back(std::move(candidate));
+      if (beam.size() == options.beam) break;
+    }
+    if (beam.empty()) {
+      std::cerr << "Search produced no states\n";
+      return 3;
+    }
+    if (!options.quiet && options.reportEvery != 0 &&
+        ((decision + 1) % options.reportEvery == 0 || decision + 1 == maximumDecisions)) {
+      const SolverNode& best = beam.front();
+      std::cout << "decision=" << (decision + 1)
+                << " frames=" << best.input.size()
+                << " seed=" << best.seed
+                << " score=" << best.state.score
+                << " level=" << best.state.level
+                << " lives=" << best.state.lives
+                << " states=" << beam.size() << '\n';
+    }
+  }
+
+  const auto resultOrder = [&](const SolverNode& a, const SolverNode& b) {
+    const bool aGoal = isGoalState(a.state);
+    const bool bGoal = isGoalState(b.state);
+    if (aGoal != bGoal) return aGoal;
+    const int aHits = hitsTaken(a.state);
+    const int bHits = hitsTaken(b.state);
+    if (aHits != bHits) return aHits < bHits;
+    if (a.state.lives != b.state.lives) return a.state.lives > b.state.lives;
+    if (a.state.score != b.state.score) return a.state.score > b.state.score;
+    if (a.state.level != b.state.level) return a.state.level > b.state.level;
+    if ((a.state.lives >= 0) != (b.state.lives >= 0)) return a.state.lives >= 0;
+    return a.evaluation > b.evaluation;
+  };
+  std::sort(beam.begin(), beam.end(), resultOrder);
+  const SolverNode& best = beam.front();
+  // Search itself stays silent, but generated replays retain normal audio
+  // when loaded by the DirectX or browser edition.
+  const uint32_t modeFlags = (options.explosion ? 4u : 0u) |
+                             (options.acchoh ? 8u : 0u);
+  const ReplayHeader header{best.seed, options.randomIndex,
+                            static_cast<uint32_t>(best.input.size()), modeFlags};
+  std::ofstream output(options.output, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    std::cerr << "Could not create replay: " << options.output << '\n';
+    return 4;
+  }
+  output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  output.write(reinterpret_cast<const char*>(best.input.data()),
+               static_cast<std::streamsize>(best.input.size()));
+  output.close();
+  if (!output) {
+    std::cerr << "Could not finish replay: " << options.output << '\n';
+    return 4;
+  }
+
+  replayPlayback_ = true;
+  startGame(best.seed, static_cast<int>(options.randomIndex));
+  replayPlayback_ = false;
+  replaySession_ = true;
+  soundEnabled_ = false;
+  for (const uint8_t input : best.input) updateForced(input);
+  if (best.state.screen == Screen::Title) {
+    for (int guard = 0; guard < 400 && screen_ != Screen::Title; ++guard)
+      updateForced(0);
+  }
+  const bool verified = score_ == best.state.score && lives_ == best.state.lives &&
+                        level_ == best.state.level;
+  const SimulationState verifiedState = captureSimulationState();
+  const bool goalReached = isGoalState(verifiedState);
+  std::cout << "output=" << options.output
+            << " frames=" << best.input.size()
+            << " seed=" << best.seed
+            << " score=" << best.state.score
+            << " level=" << best.state.level
+            << " lives=" << best.state.lives
+            << " hits=" << hitsTaken(best.state)
+            << " cleared=" << (best.state.lives > 23 || best.state.score > 99'999'998 ||
+                                      best.state.level > 31 ? "yes" : "no")
+            << " goal=" << (goalReached ? "yes" : "no")
+            << " verified=" << (verified ? "yes" : "no") << '\n';
+  return verified && (options.targetLives == 0 || goalReached) ? 0 : 5;
+}
+#endif
+
 void Gates32::browserFrame() {
   handleEvents();
   const uint32_t now = SDL_GetTicks();
@@ -2806,15 +3950,41 @@ void Gates32::browserFrame() {
 #endif
 }
 
+#ifdef __EMSCRIPTEN__
+Gates32* browserGame = nullptr;
+
+extern "C" EMSCRIPTEN_KEEPALIVE int gates32_load_dropped_replay() {
+  return browserGame && browserGame->loadReplayFile("/dropped.rep") ? 1 : 0;
+}
+#endif
+
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
   static Gates32 game;
+#ifdef GATES32_HEADLESS
+  const char* assetRoot = "assets";
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::string(argv[i]) == "--assets") {
+      assetRoot = argv[i + 1];
+      break;
+    }
+  }
+  if (!game.initializeHeadless(assetRoot)) return 1;
+  return game.runHeadlessSolver(argc, argv);
+#else
+  (void)argc;
+  (void)argv;
   if (!game.initialize()) {
     SDL_Log("Initialization failed: %s", SDL_GetError());
     return 1;
   }
 #ifdef __EMSCRIPTEN__
+  browserGame = &game;
+  EM_ASM({
+    var status = document.getElementById('status');
+    if (status) status.dataset.replayLoaderReady = 'true';
+  });
   emscripten_set_main_loop_arg([](void* arg) { static_cast<Gates32*>(arg)->browserFrame(); }, &game, 0, 1);
 #else
   // Native builds are useful for deterministic debugging.
@@ -2825,4 +3995,5 @@ int main(int, char**) {
 #endif
   game.shutdown();
   return 0;
+#endif
 }
